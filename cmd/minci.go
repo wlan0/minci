@@ -20,6 +20,7 @@ var RootCmd = &cobra.Command{
 		githubID := viper.GetString("github-id")
 		githubSecret := viper.GetString("github-secret")
 		webhookSecret := viper.GetString("webhook-secret")
+		port := viper.GetInt("port")
 
 		if len(selfURL) == 0 {
 			return errors.New("self-url cannot be empty")
@@ -37,7 +38,7 @@ var RootCmd = &cobra.Command{
 			return errors.New("webhookSecret cannot be empty")
 		}
 
-		return ci.StartCIServer(selfURL, repo, githubID, githubSecret, webhookSecret)
+		return ci.StartCIServer(selfURL, repo, githubID, githubSecret, webhookSecret, port)
 	},
 	SilenceErrors: true,
 	SilenceUsage:  true,
@@ -53,6 +54,7 @@ func init() {
 	RootCmd.Flags().String("github-id", "", "github application id")
 	RootCmd.Flags().String("github-secret", "", "github application secret")
 	RootCmd.Flags().String("webhook-secret", "", "github application webhook secret")
+	RootCmd.Flags().Int("port", 8080, "CI server port")
 
 	// parse the go default flagset to get flags for glog and other packages in future
 	RootCmd.Flags().AddGoFlagSet(flag.CommandLine)

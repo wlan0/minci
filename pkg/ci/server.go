@@ -32,7 +32,7 @@ func init() {
 	port = &portval
 }
 
-func StartCIServer(selfURL, repo, githubID, githubSecret, webhookSecret string) error {
+func StartCIServer(selfURL, repo, githubID, githubSecret, webhookSecret string, port int) error {
 	conf := &oauth2.Config{
 		ClientID:     githubID,
 		ClientSecret: githubSecret,
@@ -43,12 +43,12 @@ func StartCIServer(selfURL, repo, githubID, githubSecret, webhookSecret string) 
 		RedirectURL: selfURL,
 	}
 
-	return startCIServer(conf, selfURL, webhookSecret)
+	return startCIServer(conf, selfURL, webhookSecret, port)
 }
 
-func startCIServer(conf *oauth2.Config, selfURL, webhookSecret string) error {
+func startCIServer(conf *oauth2.Config, selfURL, webhookSecret string, port int) error {
 	s := &http.Server{
-		Addr: ":8080",
+		Addr: fmt.Sprintf(":%d", port),
 		Handler: &ciHandler{
 			config:        conf,
 			selfURL:       selfURL,
@@ -120,7 +120,7 @@ func (c *ciHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (c *ciHandler) processPullRequest(pullRequestEvent *github.PullRequestEvent) {
 	var tmpPort uint32
-	if *(pullRequestEvent.Action) != "opened" {
+	if *(pullRequestEvent.Action) != "opened" && *(pullRequestEvent.Action) != "synchronize" {
 		log.Printf("ignoring pull_request event: %s", *pullRequestEvent.Action)
 		return
 	}
@@ -135,12 +135,12 @@ func (c *ciHandler) processPullRequest(pullRequestEvent *github.PullRequestEvent
 		return
 	}
 
-	if err := c.updateStatus("wlan0", "minio", sha, github.String("pending")); err != nil {
+	if err := c.updateStatus("minio", "minio", sha, github.String("pending")); err != nil {
 		log.Printf("error updating status for minio/minio:%s %v", sha, err)
 		return
 	}
 	doneStatus := "error"
-	defer c.updateStatus("wlan0", "minio", sha, &doneStatus)
+	defer c.updateStatus("minio", "minio", sha, &doneStatus)
 
 	f, err := os.OpenFile(filepath.Join("tmp", fmt.Sprintf("%s.log", sha)), os.O_RDWR|os.O_CREATE, 0664)
 	if err != nil {
@@ -229,7 +229,7 @@ func (c *ciHandler) processPullRequest(pullRequestEvent *github.PullRequestEvent
 
 	env := os.Environ()
 	env = append(env, "MINIO_ACCESS_KEY=minio")
-	env = append(env, "MINIO_SECERT_KEY=minio123")
+	env = append(env, "MINIO_SECRET_KEY=minio123")
 	env = append(env, "AWS_ACCESS_KEY_ID=minio")
 	env = append(env, "AWS_SECRET_KEY=minio123")
 
@@ -252,6 +252,7 @@ func (c *ciHandler) processPullRequest(pullRequestEvent *github.PullRequestEvent
 		log.Printf("error starting minio %s: %v", sha, err)
 		return
 	}
+	defer minioServer.Wait()
 	defer minioServer.Process.Kill()
 
 	<-time.After(5 * time.Second)
@@ -276,6 +277,7 @@ func (c *ciHandler) processPullRequest(pullRequestEvent *github.PullRequestEvent
 		log.Printf("error starting minio %s: %v", sha, err)
 		return
 	}
+	defer minioGateway.Wait()
 	defer minioGateway.Process.Kill()
 
 	<-time.After(5 * time.Second)
@@ -301,14 +303,15 @@ func (c *ciHandler) processPullRequest(pullRequestEvent *github.PullRequestEvent
 		},
 		Dir:    filepath.Join("tmp", sha, "minio", "mint"),
 		Stdout: f,
-		Stderr: f,
-		Env:    env,
+		//Stderr: f,
+		Env: env,
 	}
 	err = mintTestBuild.Run()
 	if err != nil {
 		log.Printf("error building minio/mint: %v", err)
 		return
 	}
+	defer mintTestBuild.Wait()
 	defer mintTestBuild.Process.Kill()
 
 	env = append(env, fmt.Sprintf("SERVER_ENDPOINT=127.0.0.1:%d", gatewayPort))
@@ -350,6 +353,7 @@ func (c *ciHandler) processPullRequest(pullRequestEvent *github.PullRequestEvent
 		doneStatus = "error"
 		return
 	}
+	defer mintTests.Wait()
 	defer mintTests.Process.Kill()
 	doneStatus = "success"
 	return
@@ -357,12 +361,12 @@ func (c *ciHandler) processPullRequest(pullRequestEvent *github.PullRequestEvent
 
 func (c *ciHandler) processPush(sha string) {
 	var tmpPort uint32
-	if err := c.updateStatus("wlan0", "minio", sha, github.String("pending")); err != nil {
+	if err := c.updateStatus("minio", "minio", sha, github.String("pending")); err != nil {
 		log.Printf("error updating status for minio/minio:%s %v", sha, err)
 		return
 	}
 	doneStatus := "error"
-	defer c.updateStatus("wlan0", "minio", sha, &doneStatus)
+	defer c.updateStatus("minio", "minio", sha, &doneStatus)
 
 	f, err := os.OpenFile(filepath.Join("tmp", fmt.Sprintf("%s.log", sha)), os.O_RDWR|os.O_CREATE, 0664)
 	if err != nil {
@@ -386,7 +390,7 @@ func (c *ciHandler) processPush(sha string) {
 
 	oauthClient := c.config.Client(oauth2.NoContext, c.token)
 	client := github.NewClient(oauthClient)
-	repo, _, err := client.Repositories.Get(context.Background(), "wlan0", "minio")
+	repo, _, err := client.Repositories.Get(context.Background(), "minio", "minio")
 	if err != nil {
 		log.Printf("error getting repository: %v", err)
 		return
@@ -446,7 +450,7 @@ func (c *ciHandler) processPush(sha string) {
 
 	env := os.Environ()
 	env = append(env, "MINIO_ACCESS_KEY=minio")
-	env = append(env, "MINIO_SECERT_KEY=minio123")
+	env = append(env, "MINIO_SECRET_KEY=minio123")
 	env = append(env, "AWS_ACCESS_KEY_ID=minio")
 	env = append(env, "AWS_SECRET_KEY=minio123")
 
@@ -592,8 +596,10 @@ func (c *ciHandler) updateStatus(owner, repo, sha string, status *string) error 
 	client := github.NewClient(oauthClient)
 
 	_, _, err := client.Repositories.CreateStatus(context.Background(), owner, repo, sha, &github.RepoStatus{
-		State:     status,
-		TargetURL: github.String(fmt.Sprintf("%s/logs/%s", c.selfURL, sha)),
+		State:       status,
+		TargetURL:   github.String(fmt.Sprintf("%s/logs/%s", c.selfURL, sha)),
+		Description: github.String("mint tests: minio as s3 backend"),
+		Context:     github.String("minio-trusted/gateway-tests"),
 	})
 	return err
 }
