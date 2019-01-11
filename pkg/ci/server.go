@@ -2,6 +2,7 @@ package ci
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -47,6 +48,16 @@ func StartCIServer(selfURL, repo, githubID, githubSecret, webhookSecret string, 
 }
 
 func startCIServer(conf *oauth2.Config, selfURL, webhookSecret string, port int) error {
+	if _, err := os.Stat("token"); !os.IsNotExist(err) {
+		log.Printf("using existing token file")
+		tokenBytes, err := ioutil.ReadFile("token")
+		if err != nil {
+			log.Printf("could not read token file")
+			return err
+		}
+		return
+	}
+
 	s := &http.Server{
 		Addr: fmt.Sprintf(":%d", port),
 		Handler: &ciHandler{
@@ -82,7 +93,7 @@ func (c *ciHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/logs/") {
 		vals := strings.Split(r.URL.Path, "/")
 		sha := vals[len(vals)-1]
-		logs, err := ioutil.ReadFile(filepath.Join("tmp", fmt.Sprintf("%s.log", sha)))
+		logs, err := ioutil.ReadFile(filepath.Join("tmp", fmt.Sprintf("%s", sha)))
 		if err != nil {
 			log.Printf("error reading log file: %v", err)
 			w.WriteHeader(http.StatusNotFound)
@@ -149,6 +160,23 @@ func (c *ciHandler) processPullRequest(pullRequestEvent *github.PullRequestEvent
 	}
 	defer f.Close()
 	log := log.New(f, "", 0)
+
+	gw, err := os.OpenFile(filepath.Join("tmp", fmt.Sprintf("%s_gateway.log", sha)), os.O_RDWR|os.O_CREATE, 0664)
+	if err != nil {
+		log.Printf("error opening gateway log file: %v", err)
+		return
+	}
+	defer gw.Close()
+
+	mb, err := os.OpenFile(filepath.Join("tmp", fmt.Sprintf("%s_minio.log", sha)), os.O_RDWR|os.O_CREATE, 0664)
+	if err != nil {
+		log.Printf("error opening backend log file: %v", err)
+		return
+	}
+	defer mb.Close()
+
+	log.Printf("gateway logs: %s", fmt.Sprintf("%s/logs/%s_gateway.log", c.selfURL, sha))
+	log.Printf("backend logs: %s", fmt.Sprintf("%s/logs/%s_minio.log", c.selfURL, sha))
 
 	portLock.Lock()
 	tmpPort = *port
@@ -243,8 +271,8 @@ func (c *ciHandler) processPullRequest(pullRequestEvent *github.PullRequestEvent
 			"./data",
 		},
 		Dir:    filepath.Join("tmp", sha, "minio", "minio"),
-		Stdout: f,
-		Stderr: f,
+		Stdout: mb,
+		Stderr: mb,
 		Env:    env,
 	}
 	err = minioServer.Start()
@@ -268,8 +296,8 @@ func (c *ciHandler) processPullRequest(pullRequestEvent *github.PullRequestEvent
 			fmt.Sprintf("127.0.0.1:%d", gatewayPort),
 		},
 		Dir:    filepath.Join("tmp", sha, "minio", "minio"),
-		Stdout: f,
-		Stderr: f,
+		Stdout: gw,
+		Stderr: gw,
 		Env:    env,
 	}
 	err = minioGateway.Start()
@@ -376,6 +404,23 @@ func (c *ciHandler) processPush(sha string) {
 	defer f.Close()
 	log := log.New(f, "", 0)
 
+	gw, err := os.OpenFile(filepath.Join("tmp", fmt.Sprintf("%s_gateway.log", sha)), os.O_RDWR|os.O_CREATE, 0664)
+	if err != nil {
+		log.Printf("error opening gateway log file: %v", err)
+		return
+	}
+	defer gw.Close()
+
+	mb, err := os.OpenFile(filepath.Join("tmp", fmt.Sprintf("%s_minio.log", sha)), os.O_RDWR|os.O_CREATE, 0664)
+	if err != nil {
+		log.Printf("error opening backend log file: %v", err)
+		return
+	}
+	defer mb.Close()
+
+	log.Printf("gateway logs: %s", fmt.Sprintf("%s/logs/%s_gateway.log", c.selfURL, sha))
+	log.Printf("backend logs: %s", fmt.Sprintf("%s/logs/%s_minio.log", c.selfURL, sha))
+
 	portLock.Lock()
 	tmpPort = *port
 	newPort := atomic.AddUint32(port, 2)
@@ -464,8 +509,8 @@ func (c *ciHandler) processPush(sha string) {
 			"./data",
 		},
 		Dir:    filepath.Join("tmp", sha, "minio", "minio"),
-		Stdout: f,
-		Stderr: f,
+		Stdout: mb,
+		Stderr: mb,
 		Env:    env,
 	}
 	err = minioServer.Start()
@@ -488,8 +533,8 @@ func (c *ciHandler) processPush(sha string) {
 			fmt.Sprintf("127.0.0.1:%d", gatewayPort),
 		},
 		Dir:    filepath.Join("tmp", sha, "minio", "minio"),
-		Stdout: f,
-		Stderr: f,
+		Stdout: gw,
+		Stderr: gw,
 		Env:    env,
 	}
 	err = minioGateway.Start()
@@ -589,6 +634,17 @@ func (c *ciHandler) exchangeToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.token = token
+
+	tokenJSON, err := json.MarshalIndent(token, "", " ")
+	if err != nil {
+		log.Printf("could not marshal token: %v", err)
+		return
+	}
+
+	if err := ioutil.WriteFile("token", []byte(tokenJSON), 0664); err != nil {
+		log.Printf("oauth token could not be saved: %v", err)
+		return
+	}
 }
 
 func (c *ciHandler) updateStatus(owner, repo, sha string, status *string) error {
@@ -597,7 +653,7 @@ func (c *ciHandler) updateStatus(owner, repo, sha string, status *string) error 
 
 	_, _, err := client.Repositories.CreateStatus(context.Background(), owner, repo, sha, &github.RepoStatus{
 		State:       status,
-		TargetURL:   github.String(fmt.Sprintf("%s/logs/%s", c.selfURL, sha)),
+		TargetURL:   github.String(fmt.Sprintf("%s/logs/%s.log", c.selfURL, sha)),
 		Description: github.String("mint tests: minio as s3 backend"),
 		Context:     github.String("minio-trusted/gateway-tests"),
 	})
